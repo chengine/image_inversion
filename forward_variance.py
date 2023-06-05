@@ -2,9 +2,10 @@
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-import scipy.sparse.linalg as linalg
-import scipy
+import torch
+import torch.optim as optim
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def find_POI(img_rgb, render=False): # img - RGB image in range 0...255
     img = np.copy(img_rgb)
     img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -30,83 +31,25 @@ def find_POI(img_rgb, render=False): # img - RGB image in range 0...255
 
     return xy, extras # pixel coordinates
 
+def logit(y):
+
+    return torch.log(y / (1. - y))
+
 class Model():
     def __init__(self, H, W) -> None:
         self.H = H
         self.W = W
-
-    def avg_blur_H(self):
-        vec_dim = self.H*self.W
-
-        test_vec = np.zeros(vec_dim)
-
-        K = []
-
-        for i in range(self.H*self.W):
-            test_vec[i] = 1
-            test_img = test_vec.reshape(self.H, self.W)
-            output_img = self.avg_blur(test_img)
-            sparse_output = scipy.sparse.csc_matrix(output_img.reshape(-1, 1))
-            K.append(sparse_output)
-            test_vec[i] = 0
-
-        K = scipy.sparse.hstack(K)
-  
-        self.ab_H = K
-
-        return K
-
-    def gaussian_blur_H(self):
-        vec_dim = self.H*self.W
-
-        test_vec = np.zeros(vec_dim)
-
-        K = []
-
-        for i in range(self.H*self.W):
-            test_vec[i] = 1
-            test_img = test_vec.reshape(self.H, self.W)
-            output_img = self.gaussian_blur(test_img)
-            K.append(scipy.sparse.csc_matrix(output_img.reshape(-1, 1)))
-            test_vec[i] = 0
-
-        K = scipy.sparse.hstack(K)
-  
-        self.gb_H = K
-
-        return K
-
-    def grayscale_H(self):
-        N = self.H * self.W
-
-        element = scipy.sparse.csr_matrix([0.2989, 0.5870, 0.1140])
-
-        self.gray_H = scipy.sparse.block_diag([element]*N)
-
-        return self.gray_H
 
     def cvt_grayscale(self, img):
         # Perform gray scaling
         img = 0.2989*img[..., 0] + 0.5870*img[..., 1] + 0.1140*img[..., 2]
 
         return img
-    
-    def avg_blur(self, img):
-        # img = img.permute(2, 0, 1)
-        # img = img.unsqueeze(0)
 
-        # img = torch.nn.functional.avg_pool2d(img, 5, stride=1, padding=2, count_include_pad=False)
-        # img = img.squeeze()
-        # img = img.permute(1, 2, 0)
-
-        img = cv2.blur(img, (5, 5), cv2.BORDER_DEFAULT)
-    
-        return img
-    
-    def gaussian_blur(self, img):
+    def blur(self, img):
 
         # Perform Gaussian blur on img
-        img = cv2.GaussianBlur(img,(5,5),cv2.BORDER_DEFAULT)
+        img = torch.nn.functional.avg_pool2d(img,5,stride=1, padding=2, count_include_pad=False)
 
         return img
 
@@ -145,14 +88,16 @@ class Model():
         batch = interest_regions[rand_inds]
 
         prior = np.random.uniform(size=gt_img.shape)
+        mask = np.ones(gt_img.shape[:-1], dtype=bool)
         prior[batch[:, 0], batch[:, 1]] = gt_img[batch[:, 0], batch[:, 1]]
+        mask[batch[:, 0], batch[:, 1]] = False
 
-        return prior
+        return prior, mask
     
     def PSNR(self, img1, img2):
-        mse = np.mean((img1 - img2)**2)
+        mse = torch.mean((img1 - img2)**2)
 
-        PSNR = -np.log10(mse)
+        PSNR = -torch.log10(mse)
 
         return PSNR
     
@@ -166,42 +111,72 @@ img = cv2.resize(img, (200, 200), interpolation = cv2.INTER_AREA)
 
 # Instantiate model class
 model = Model(img.shape[0], img.shape[1])
-prior = model.prior(img, Nsamples=10000)
+prior, mask = model.prior(img, Nsamples=1)
 
 img = img/255.
-prior = prior
 
-H_gray = model.grayscale_H()
-obs_img = H_gray @ img.flatten()
-obs_img = obs_img.reshape(img.shape[:-1])
+img = torch.tensor(img, device=device)
+prior, mask = torch.tensor(prior, device=device), torch.tensor(mask, device=device)
 
 # Convert image to grayscale so there's only 1 channel
 gray_img = model.cvt_grayscale(img)
 
 # Perform average blurring
-H_avg_blur = model.gaussian_blur_H()     # and get the H matrix
-obs_img = model.gaussian_blur(obs_img)
+obs_img = model.blur(gray_img[None, None, ...])
+obs_img = (obs_img**2).squeeze()
 
-#%% Solving inverse problem using pseudoinverse
+# obs_img_offset = obs_img - model.blur(model.cvt_grayscale(prior)[None, None,...]).squeeze()
+#%% Generate Q matrix
+theta1 = 1
+r = 1e-3
 
-output = linalg.lsqr(H_avg_blur @ H_gray, obs_img.flatten()) #- H_avg_blur @ H_gray @ prior.flatten())
-pred_img = output[0]
+# Y, X = np.meshgrid(np.arange(img.shape[0]), np.arange(img.shape[1]))
+# xv = X.flatten()
+# yv = Y.flatten()
+# d = theta1*np.exp(-(0.5)*np.sqrt((xv[0]-xv)**2 + (yv[0]-yv)**2))
+# d[0] = 0
 
-# pred_img = linalg.spsolve(H_gray, obs_img.flatten())
-pred_img = pred_img.reshape(img.shape) + prior  # The predicted input
-pred_img = np.clip(pred_img, 0., 1.)
+# Q_element = scipy.linalg.toeplitz(d)
+# Q_element = Q_element.T
+# Q_element = Q_element.T @ Q_element
+# Q_inv = torch.tensor(Q_element, device=device, dtype=torch.float32)
+
+r_inv = 1/r
+
+#%% Optimize
+s = torch.randn(img.shape, device=device, requires_grad=True)
+optimizer = optim.Adam([s], lr=0.01)
+
+N = 5000
+
+for i in range(N):
+    optimizer.zero_grad()
+
+    s_ = s*mask[..., None] + prior
+    gray_img_pred = model.cvt_grayscale(s_)
+    pred_obs = model.blur(gray_img_pred[None, None, ...])
+
+    pred_loss = r_inv * torch.mean((obs_img - pred_obs**2)**2)
+    reg_loss = torch.mean((model.blur(s_) - s_)**2)
+
+    loss = pred_loss + reg_loss
+
+    loss.backward()
+    optimizer.step()
+    print(i, loss)
 #%% Plotting
+pred_img = torch.clip(s_, 0., 1.)
 fig, (ax1, ax2, ax3) = plt.subplots(3, figsize=(15, 15))
-ax1.imshow(gray_img, cmap='gray')    # Original img
-ax2.imshow(obs_img, cmap='gray')    # Blurred image
-ax3.imshow(pred_img)   # Inverse problem from blurred image
+ax1.imshow(gray_img.cpu(), cmap='gray')    # Original img
+ax2.imshow(obs_img.cpu().reshape(img.shape[:-1]), cmap='gray')    # Blurred image
+ax3.imshow(pred_img.detach().cpu())   # Inverse problem from blurred image
 plt.show()
 
 print('PSNR', model.PSNR(img, pred_img))
 print('PSNR', model.PSNR(img, prior))
 # %% Save images
-cv2.imwrite('og_grayscale.jpg', (255*gray_img).astype(np.uint8))
-cv2.imwrite('obs_img.jpg', (255*obs_img).astype(np.uint8))
-cv2.imwrite('pred_img.jpg', cv2.cvtColor((255*pred_img).astype(np.uint8), cv2.COLOR_RGB2BGR))
-cv2.imwrite('prior.jpg', cv2.cvtColor((255*prior).astype(np.uint8), cv2.COLOR_RGB2BGR))
+cv2.imwrite('og_grayscale.jpg', (255*gray_img.cpu().numpy()).astype(np.uint8))
+cv2.imwrite('obs_img.jpg', (255*obs_img.cpu().numpy()).astype(np.uint8))
+cv2.imwrite('pred_img.jpg', cv2.cvtColor((255*pred_img.detach().cpu().numpy()).astype(np.uint8), cv2.COLOR_RGB2BGR))
+cv2.imwrite('prior.jpg', cv2.cvtColor((255*prior.cpu().numpy()).astype(np.uint8), cv2.COLOR_RGB2BGR))
 # %%
